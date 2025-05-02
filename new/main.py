@@ -791,11 +791,6 @@ def plot_loss_curves(train_losses, val_losses, filename="loss_curves.png"):
         print(f"保存损失曲线图时出错：{e}")
     plt.close()
 
-# --- 移除：plot_attention_weights 函数 ---
-# 注意力绘图函数已被移除，因为它特定于旧模型架构。
-# iTransformer 使用不同的自注意力机制，可视化方式不同。
-
-
 # ===== 6. 主函数 (已修改) =====
 def main():
     # --- 参数解析器 (为 iTransformer 修改) ---
@@ -818,9 +813,12 @@ def main():
     parser.add_argument('--embed', type=str, default='timeF', help='时间嵌入类型 (例如, timeF, fixed, learned)') # 来自 iTransformer 代码库
     parser.add_argument('--freq', type=str, default='h', help='时间特征的频率 (仅在使用时间特征时相关)') # 来自 iTransformer 代码库
     # 训练超参数
-    parser.add_argument('--epochs', type=int, default=50, help='训练周期数') # 调整了默认值
+    parser.add_argument('--epochs', type=int, default=100, help='训练周期数') # 调整了默认值
     parser.add_argument('--batch_size', type=int, default=16, help='批次大小') # 可能调整了默认值
     parser.add_argument('--lr', type=float, default=1e-4, help='学习率')
+    parser.add_argument('--patch_len', type=int, default=16, help='Length of the patch for PatchTST-like embedding')
+    parser.add_argument('--stride', type=int, default=8, help='Stride between patches for PatchTST-like embedding')
+    # ... other arguments ...
     # 数据加载和预处理
     parser.add_argument('--num_workers', type=int, default=4, help='DataLoader 工作进程数')
     # valve_proc 应用于目标变量

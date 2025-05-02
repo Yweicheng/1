@@ -127,20 +127,182 @@ class DataEmbedding(nn.Module):
 
 
 class DataEmbedding_inverted(nn.Module):
-    def __init__(self, c_in, d_model, embed_type='fixed', freq='h', dropout=0.1):
+    def __init__(self, seq_len, d_model, num_features, dropout=0.1):
+        """
+        iTransformer Embedding with Convolutional Feature Extraction.
+
+        Args:
+            seq_len (int): Input sequence length (L).
+            d_model (int): Dimension of model hidden states.
+            num_features (int): Number of variates/features (N).
+            dropout (float): Dropout rate.
+        """
         super(DataEmbedding_inverted, self).__init__()
-        self.value_embedding = nn.Linear(c_in, d_model)
+        self.num_features = num_features
+        self.d_model = d_model
+
+        # 1. 1D Convolutional Layers to process the time dimension (L)
+        # We treat each variate's sequence independently.
+        # Input shape for convs: [B*N, 1, L]
+        # Output shape target after convs and pooling: [B*N, d_model]
+
+        # Example CNN structure (tune these parameters):
+        # Layer 1: Input [1, L] -> Output [d_model/2, L_out1]
+        self.conv1 = nn.Conv1d(
+            in_channels=1,
+            out_channels=d_model // 2,
+            kernel_size=3,
+            padding=1, # Preserves length with kernel_size=3
+            bias=False
+        )
+        self.relu1 = nn.ReLU()
+        # Layer 2: Input [d_model/2, L_out1] -> Output [d_model, L_out2]
+        self.conv2 = nn.Conv1d(
+            in_channels=d_model // 2,
+            out_channels=d_model,
+            kernel_size=3,
+            padding=1, # Preserves length with kernel_size=3
+            bias=False
+        )
+        self.relu2 = nn.ReLU()
+
+        # 2. Global Average Pooling to aggregate features over the time dimension
+        # Input shape: [B*N, d_model, L_out2] -> Output shape: [B*N, d_model, 1]
+        self.global_pool = nn.AdaptiveAvgPool1d(1)
+
+        # 3. Positional Embedding (learnable) for each variate
+        # Shape: [1, N, d_model]
+        self.position_embedding = nn.Parameter(torch.randn(1, num_features, d_model))
+
+        # 4. Dropout Layer
         self.dropout = nn.Dropout(p=dropout)
 
-    def forward(self, x, x_mark):
+    def forward(self, x, x_mark): # x shape: [B, L, N], x_mark is ignored here
+        """
+        Forward pass for convolutional inverted embedding.
+
+        Args:
+            x (torch.Tensor): Input tensor with shape [Batch, SeqLen, NumFeatures].
+            x_mark (torch.Tensor): Temporal features (ignored in this embedding).
+
+        Returns:
+            torch.Tensor: Output embedding with shape [Batch, NumFeatures, d_model].
+        """
+        B, L, N = x.shape
+        assert N == self.num_features, f"Input feature mismatch: expected {self.num_features}, got {N}"
+
+        # 1. Permute: [B, L, N] -> [B, N, L]
         x = x.permute(0, 2, 1)
-        # x: [Batch Variate Time]
-        if x_mark is None:
-            x = self.value_embedding(x)
-        else:
-            x = self.value_embedding(torch.cat([x, x_mark.permute(0, 2, 1)], 1))
-        # x: [Batch Variate d_model]
-        return self.dropout(x)
+
+        # 2. Reshape for independent convolutional processing: [B, N, L] -> [B*N, 1, L]
+        x_reshaped = x.reshape(B * N, 1, L)
+
+        # 3. Apply CNN layers
+        x_conv = self.relu1(self.conv1(x_reshaped)) # [B*N, d_model/2, L]
+        x_conv = self.relu2(self.conv2(x_conv))     # [B*N, d_model, L]
+
+        # 4. Apply Global Average Pooling over the time dimension (L)
+        x_pooled = self.global_pool(x_conv) # [B*N, d_model, 1]
+
+        # 5. Squeeze the last dimension: [B*N, d_model, 1] -> [B*N, d_model]
+        x_squeezed = x_pooled.squeeze(-1)
+
+        # 6. Reshape back to [B, N, d_model]
+        value_embedding = x_squeezed.reshape(B, N, self.d_model)
+
+        # 7. Add positional embedding (broadcasts along Batch dimension)
+        output = value_embedding + self.position_embedding
+
+        # 8. Apply dropout
+        return self.dropout(output) # Final shape: [B, N, d_model]
+
+class DataEmbedding_inverted_Patch(nn.Module):
+    def __init__(self, seq_len, patch_len, stride, d_model, num_features, dropout=0.1):
+        """
+        iTransformer Embedding using Patches inspired by PatchTST.
+
+        Args:
+            seq_len (int): Input sequence length (L).
+            patch_len (int): Length of each patch (P).
+            stride (int): Stride between consecutive patches (S).
+            d_model (int): Dimension of model hidden states.
+            num_features (int): Number of variates/features (N).
+            dropout (float): Dropout rate.
+        """
+        super(DataEmbedding_inverted_Patch, self).__init__()
+        self.seq_len = seq_len
+        self.patch_len = patch_len
+        self.stride = stride
+        self.d_model = d_model
+        self.num_features = num_features
+
+        # Calculate the number of patches
+        # Formula: floor((L - P) / S) + 1
+        self.num_patches = math.floor((seq_len - patch_len) / stride) + 1
+        print(f"--- Patch Embedding Info ---")
+        print(f"Seq Len: {seq_len}, Patch Len: {patch_len}, Stride: {stride}")
+        print(f"Number of patches: {self.num_patches}")
+        print(f"---------------------------")
+
+
+        # 1. Patching happens implicitly in the forward pass using unfold.
+
+        # 2. Patch Embedding Layer
+        # Embeds each patch of length `patch_len` into `d_model` dimension.
+        self.patch_embedding = nn.Linear(patch_len, d_model, bias=True)
+
+        # 3. Positional Embedding (learnable) for each variate (remains the same)
+        # Shape: [1, N, d_model]
+        self.position_embedding = nn.Parameter(torch.randn(1, num_features, d_model))
+
+        # 4. Aggregation Strategy (Here we use simple averaging over patches)
+        # Other strategies like using a small Transformer could be explored.
+
+        # 5. Dropout Layer
+        self.dropout = nn.Dropout(p=dropout)
+
+    def forward(self, x, x_mark): # x shape: [B, L, N], x_mark is ignored here
+        """
+        Forward pass for patch-based inverted embedding.
+
+        Args:
+            x (torch.Tensor): Input tensor with shape [Batch, SeqLen, NumFeatures].
+            x_mark (torch.Tensor): Temporal features (ignored in this embedding).
+
+        Returns:
+            torch.Tensor: Output embedding with shape [Batch, NumFeatures, d_model].
+        """
+        B, L, N = x.shape
+        assert L == self.seq_len, f"Input sequence length mismatch: expected {self.seq_len}, got {L}"
+        assert N == self.num_features, f"Input feature mismatch: expected {self.num_features}, got {N}"
+
+        # 1. Permute: [B, L, N] -> [B, N, L]
+        # We want to patch along the L dimension for each N
+        x = x.permute(0, 2, 1)
+
+        # 2. Reshape for patching: [B, N, L] -> [B*N, L]
+        # Process each variate's sequence independently
+        x_reshaped = x.reshape(B * N, L)
+
+        # 3. Create Patches using unfold: [B*N, L] -> [B*N, num_patches, patch_len]
+        # unfold(dimension, size, step)
+        x_unfolded = x_reshaped.unfold(dimension=1, size=self.patch_len, step=self.stride)
+
+        # 4. Apply Patch Embedding Layer: [B*N, num_patches, patch_len] -> [B*N, num_patches, d_model]
+        x_embedded_patches = self.patch_embedding(x_unfolded)
+
+        # 5. Aggregate Patch Embeddings: [B*N, num_patches, d_model] -> [B*N, d_model]
+        # Using simple average pooling over the num_patches dimension.
+        value_embedding_aggregated = torch.mean(x_embedded_patches, dim=1)
+
+        # 6. Reshape back to [B, N, d_model]
+        value_embedding = value_embedding_aggregated.reshape(B, N, self.d_model)
+
+        # 7. Add positional embedding (broadcasts along Batch dimension)
+        output = value_embedding + self.position_embedding
+
+        # 8. Apply dropout
+        return self.dropout(output) # Final shape: [B, N, d_model]
 
 
 class DataEmbedding_wo_pos(nn.Module):
